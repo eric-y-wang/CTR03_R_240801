@@ -1,0 +1,412 @@
+---
+title: "CTR03 CRISPR and Mixscale Processing"
+author: "Eric Y. Wang"
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+  github_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(Seurat)
+library(ggplot2)
+library(cowplot)
+library(patchwork)
+library(grid)
+library(gridExtra)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+source("functions/plotting_fxns.R")
+source("functions/scRNA_seq_analysis_functions.R")
+theme_set(theme_Publication())
+```
+
+## [Import data]{.underline}
+
+```{r}
+data <- readRDS("C:/Users/Eric/My Drive/Lab/datasets/EYW/CTR03_10x_240801/seurat_outs/CTR03_full.rds")
+```
+
+## [sgRNA summary statistics]{.underline}
+
+```{r, fig.height=5, fig.width=11}
+# filter metadata to only include HTO classified singlets
+metaSignletHTO <- data@meta.data %>%
+  filter(HTO_classification.global == "Singlet") %>%
+  as_tibble()
+
+clusterFeatureCat <- metaSignletHTO %>%
+  group_by(crispr_classification) %>%
+  summarise(feature_counts = n()) %>%
+  mutate(total = sum(feature_counts)) %>%
+  ungroup() %>%
+  mutate(feature_perc = feature_counts/total*100) %>%
+  mutate(sgRNA_detected = ifelse(crispr_classification == "none","no","yes")) %>%
+  mutate(crispr_classification = factor(crispr_classification, c("none","singlet","multiplet")))
+
+clusterFeatureCatDetected <- metaSignletHTO %>%
+  filter(crispr_classification != "none") %>%
+  group_by(num_features) %>%
+  summarise(feature_counts = n()) %>%
+  mutate(total = sum(feature_counts)) %>%
+  ungroup() %>%
+  mutate(feature_perc = feature_counts/total*100,
+         num_features = factor(num_features, rev(c(1,2,3,4,5,6,7))))
+
+clusterFeatureCat
+clusterFeatureCatDetected
+
+p1 <- ggplot(clusterFeatureCat, aes(x = "", y = feature_perc, fill = crispr_classification)) +
+  geom_bar(position = "fill", stat = "identity") +
+  scale_fill_brewer(palette = "Dark2") +
+  scale_y_continuous(expand = c(0,0), breaks = seq(0,1,0.1)) +
+  ggtitle("Guide detection calls\nin total cells")
+  
+
+p2 <- ggplot(clusterFeatureCat, aes(x = "", y = feature_perc, fill = sgRNA_detected)) +
+  geom_bar(position = "fill", stat = "identity") +
+  scale_fill_brewer(palette = "Dark2") +
+  scale_y_continuous(expand = c(0,0), breaks = seq(0,1,0.1)) +
+  ggtitle("Guide detection calls\nin total cells")
+
+p3 <- ggplot(clusterFeatureCatDetected, aes(x = "", y = feature_perc, fill = num_features)) +
+  geom_bar(position = "fill", stat = "identity") +
+  scale_fill_viridis_d() +
+  scale_y_continuous(expand = c(0,0), breaks = seq(0,1,0.1)) +
+  ggtitle("Guide detection calls\nin cells with sgRNA")
+
+p1+p2+p3
+ggsave("analysis_outs/guide_detection_CTR03.pdf")
+```
+
+## [Remove doublets]{.underline}
+
+```{r}
+# get counts for classified droplets
+table(HTO=data$HTO_classification.global)/ncol(data)*100
+
+# get counts for classified droplets
+table(CRISPR_call=data$crispr_classification)/ncol(data)*100
+
+# get counts for classified droplets
+table(HTO=data$HTO_classification.global, CRISPR_call=data$crispr_classification)
+
+# get percentage of total for classified droplets
+table(HTO=data$HTO_classification.global, CRISPR_call=data$crispr_classification)/ncol(data)*100
+```
+
+For filtering doublets, I will filter on CRISPR singlets and not HTO singlets for now. For intratissue comparisons I will further filter on HTO singlets. 
+
+```{r}
+dataSinglet <- subset(data, subset = crispr_classification == "singlet")
+```
+
+## [Add Additional Metadata]{.underline}
+```{r}
+# create feature gene column with just gene being targeted (not individual guide)
+dataSinglet$feature_gene <- gsub("\\..*","",dataSinglet$feature_call)
+dataSinglet$feature_call_control <- gsub("NTC\\.\\d+$|NCC\\.\\d+$","control",dataSinglet$feature_call)
+dataSinglet$feature_gene <- gsub("NTC|NCC","control",dataSinglet$feature_gene)
+dataSinglet$feature_binary <- ifelse(dataSinglet$feature_gene == "control","control","perturbed")
+
+# create columns for organ and group based on HTO tags
+hashSplit <- dataSinglet@meta.data %>%
+  dplyr::select(hash.ID) %>%
+  separate(hash.ID,c("organ","group"), sep = "-")
+dataSinglet$organ <- hashSplit$organ
+dataSinglet$group <- hashSplit$group
+```
+
+This will throwh an error because some cells are labelled as Doublets by HTO. This is fine.
+
+## [Normalize SCT To Control]{.underline}
+
+Here we will create SCT counts that are normalized to control cells. The "counts" slot of SCT should be sequencing depth corrected as they are reverse transformed from pearson residuals
+
+```{r}
+library(Matrix)
+
+# make vector of control cells
+controlCells <- rownames(dataSinglet@meta.data %>% filter(feature_call_control == "control"))
+
+normalize_matrix_to_control <- function(seurat_obj, control_cells) {
+  matrix <- GetAssayData(seurat_obj, slot = "data", assay = "SCT")
+  control_matrix <- matrix[, control_cells]
+  
+  # find mean and SD for each row
+  control_mean <- rowMeans(control_matrix)
+  control_std <- apply(control_matrix, 1, sd)
+  
+  # perform row-wise calculations
+  normalized_matrix <- sweep(matrix, 1, control_mean, "-")
+  normalized_matrix <- sweep(normalized_matrix, 1, control_std, "/")
+  
+  # sparsify matrix
+  normalized_matrix <- Matrix(normalized_matrix, sparse = T)
+  
+  seurat_obj[['SCT_control_normalized']] <- CreateAssayObject(data = normalized_matrix)
+  return(seurat_obj)
+}
+
+dataSinglet <- normalize_matrix_to_control(dataSinglet,controlCells)
+```
+
+```{r}
+DefaultAssay(dataSinglet) <- "SCT_control_normalized"
+
+dataSinglet <- ScaleData(dataSinglet)
+dataSinglet <- FindVariableFeatures(dataSinglet, assay = "SCT_control_normalized")
+
+# remove TCR genes from variable features
+featureVar <- VariableFeatures(dataSinglet, assay = "SCT_control_normalized")
+TCRgenes <- grep("^Tra[vj]|^Trb[vdj]",featureVar)
+BCRgenes <- grep("^Igk[vc]|^Igl[vc]|^Ighv",featureVar)
+featureVar[TCRgenes]
+featureVar[BCRgenes]
+
+VariableFeatures(dataSinglet, assay = "SCT_control_normalized") <- featureVar[-c(TCRgenes,BCRgenes)]
+
+# run PCA using TCR/BCR excluded Variable Features
+dataSubQC <- RunPCA(dataSinglet, npcs = 60, verbose = FALSE)
+ElbowPlot(dataSubQC, ndims = 60) +
+  ggtitle("dataSubQC Elbow") +
+  scale_x_continuous(breaks = seq(0,60,3))
+```
+
+```{r}
+dimValues <- 30
+# run umap based on dimensionality from elbow plot
+dataSubQC <- RunUMAP(dataSubQC, dims = 1:dimValues, verbose = F) %>%
+  FindNeighbors(dims = 1:dimValues, verbose = FALSE) %>%
+  FindClusters(resolution = seq(0,1.2,0.1),
+               algorithm = 1)
+```
+
+```{r, fig.height=20, fig.width=20}
+DimPlot(dataSubQC, split.by = "feature_gene", ncol = 5, pt.size = 1)
+
+
+dataSubQC@meta.data %>%
+  as_tibble() %>%
+  group_by(feature_gene, seurat_clusters) %>%
+  summarise(n = n()) %>%
+  mutate(total = sum(n)) %>%
+  mutate(freq = n/total) %>%
+  ggplot(aes(x = feature_gene, y = freq, fill = seurat_clusters)) +
+    geom_bar(stat = "identity")
+
+FeaturePlot(dataSubQC, "Ifngr1")
+```
+
+## [Resting Activated T cell Identification]{.underline}
+
+```{r, fig.height=6, fig.width=12}
+cd44Data <- tibble(cell_barcode = colnames(dataSinglet),
+                   protein = dataSinglet@assays$CITE@data["CD44",],
+                   transcript = unlist(FetchData(dataSinglet, vars = "Cd44",slot = "RNA", layer = "data")))
+sellData <- tibble(cell_barcode = colnames(dataSinglet),
+                   protein = dataSinglet@assays$CITE@data["CD62L",],
+                   transcript = unlist(FetchData(dataSinglet, vars = "Sell",slot = "RNA", layer = "data")))
+
+p1 <- ggplot(cd44Data, aes(x = protein, y = transcript)) +
+  geom_pointdensity() +
+  scale_color_viridis_c() +
+  theme(aspect.ratio = 1) +
+  ylab("RNA_Cd44") +
+  xlab("CITE_CD44")
+
+p2 <- ggplot(sellData, aes(x = protein, y = transcript)) +
+  geom_pointdensity() +
+  scale_color_viridis_c() +
+  theme(aspect.ratio = 1) +
+  ylab("RNA_Sell") +
+  xlab("CITE_CD62L")
+  
+
+p1+p2
+```
+
+Interesting that protein and transcript seem to be negatively correlated. One possibility is that because I did the CITE-seq stain after sorting, there was receptor downregulation so the protein staining is not accurate? **Sell expression level was highly correlated with CD62L pos vs neg in CTR02.**
+
+```{r}
+library(ggpointdensity)
+
+citeData <- tibble(cell_barcode = colnames(dataSinglet),
+                   CD62L = dataSinglet@assays$CITE@data["CD62L",],
+                   CD44 = dataSinglet@assays$CITE@data["CD44",])
+
+p1 <- ggplot(citeData, aes(x = CD44, y = CD62L)) +
+  geom_pointdensity() +
+  scale_color_viridis_c() +
+  theme(aspect.ratio = 1)
+p1
+```
+
+```{r}
+CellSelector(p1)
+```
+
+## [Mixscape]{.underline}
+
+```{r}
+# calculate perturbation signatures
+dataSinglet <- CalcPerturbSig(dataSinglet,
+                             assay = "SCT",
+                             slot = "data",
+                             gd.class = "feature_gene",
+                             nt.cell.class = "control",
+                             ndims=50,
+                             num.neighbors = 20,
+                             new.assay.name = "PRTB")
+
+# Prepare PRTB assay for dimensionality reduction: 
+# Normalize data, find variable features and center data.
+DefaultAssay(dataSinglet) <- 'PRTB'
+
+# Use variable features from SCT assay.
+VariableFeatures(dataSinglet) <- VariableFeatures(object = dataSinglet[["SCT"]])
+dataSinglet <- ScaleData(dataSinglet, do.scale = F, do.center = T)
+
+# Run PCA to reduce the dimensionality of the data.
+dataSinglet <- RunPCA(dataSinglet, reduction.key = 'prtbpca', reduction.name = 'prtbpca')
+
+# Run UMAP to visualize clustering in 2-D.
+dataSinglet <- RunUMAP(
+  object = dataSinglet, 
+  dims = 1:50, 
+  reduction = 'prtbpca', 
+  reduction.key = 'prtbumap_', 
+  reduction.name = 'prtbumap')
+```
+
+```{r, fig.height=10, fig.width=10}
+q1 <- DimPlot(
+  object = dataSinglet, 
+  group.by = 'organ', 
+  reduction = 'prtbumap', 
+  pt.size = 0.2, cols = "Dark2", label = F, repel = T) +
+    scale_color_brewer(palette = "Dark2") +
+    ggtitle("Organ") +
+    ylab("UMAP 2") +
+    xlab("UMAP 1") +
+    theme(aspect.ratio = 1)
+
+q2 <- DimPlot(
+  object = dataSinglet, 
+  group.by = 'group', 
+  reduction = 'prtbumap', 
+  pt.size = 0.2, cols = "Dark2", label = F, repel = T) +
+    scale_color_brewer(palette = "Dark2") +
+    ggtitle("Group") +
+    ylab("UMAP 2") +
+    xlab("UMAP 1") +
+    theme(aspect.ratio = 1)
+
+q3 <- DimPlot(
+  object = dataSinglet, 
+  group.by = 'Phase', 
+  reduction = 'prtbumap', 
+  pt.size = 0.2, label = F, repel = T) +
+    ggtitle("Cell Cycle Phase") +
+    ylab("UMAP 2") +
+    xlab("UMAP 1") +
+    theme(aspect.ratio = 1)
+
+q4 <- DimPlot(
+  object = dataSinglet, 
+  group.by = 'feature_binary', 
+  reduction = 'prtbumap', 
+  pt.size = 0.2, label = F, repel = T) +
+    ggtitle("Cell Cycle Phase") +
+    ylab("UMAP 2") +
+    xlab("UMAP 1") +
+    theme(aspect.ratio = 1)
+
+q1+q2+q3+q4+plot_layout(ncol = 2)
+```
+
+```{r}
+# Run mixscape.
+dataSinglet <- RunMixscape(
+  object = dataSinglet, 
+  assay = "PRTB", 
+  slot = "scale.data", 
+  labels = "feature_gene", 
+  nt.class.name = "control", 
+  min.de.genes = 5,
+  logfc.threshold = 0.5,
+  iter.num = 10, 
+  de.assay = "SCT", 
+  verbose = T,
+  prtb.type = "KO")
+```
+
+```{r, fig.height=8, fig.width=10}
+metadata <- dataSinglet@meta.data
+
+# Calculate percentage of KO cells for all sgRNA
+perturbTib <- metadata %>%
+  group_by(feature_call) %>%
+  count(mixscape_class.global) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup() %>%
+  select(-n)
+
+# Transform the data
+perturbTib <- perturbTib %>%
+  mutate(gene = str_extract(feature_call, "^[^.]+"),
+         guide_number = str_extract(feature_call, "(?<=\\.)\\d+")) %>%
+  filter(!(gene %in% c("NTC","NCC"))) %>%
+  mutate(mixscape_class.global = factor(mixscape_class.global, levels = c("NP", "KO"))) %>%
+  arrange(desc(prop)) %>%
+  mutate(feature_call = factor(feature_call, levels = unique(feature_call)))
+
+
+ggplot(perturbTib, aes(x = guide_number, y = prop * 100, fill = mixscape_class.global)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("grey79", "coral1")) +
+  ylab("% of cells") +
+  xlab("sgRNA") +
+  facet_wrap(vars(gene), ncol = 5, scales = "free") +
+  labs(fill = "mixscape class")
+```
+
+```{r, fig.height=4, fig.width=15}
+genesPlot <- c("Ifnar1","Ifngr1","Tgfbr2")
+
+perturbScores <- vector(mode = "list")
+for(genes in genesPlot){
+  perturbScores[[genes]] <- PlotPerturbScore(object = dataSinglet, 
+                 target.gene.class = "feature_gene",
+                 target.gene.ident = genes, 
+                 mixscape.class = "mixscape_class", 
+                 col = "coral2") +labs(fill = "mixscape_class") +
+                ggtitle(paste(genes)) +
+                NoLegend()
+}
+
+grid.arrange(grobs = perturbScores, ncol = 3)
+```
+
+## [Save RDS]{.underline}
+
+```{r}
+saveRDS(dataSinglet,"C:/Users/Eric/My Drive/Lab/datasets/EYW/CTR03_10x_240801/seurat_outs/CTR03_mixscape_crispr_singlet.rds")
+```
+
+
+
+
+
+
+
+
+
+

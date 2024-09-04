@@ -1,0 +1,152 @@
+---
+title: "Pseudobulk sgRNA analysis"
+author: "Eric Y. Wang"
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+  github_document:
+    toc: true
+    html_preview: false
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(Seurat)
+library(ggplot2)
+library(cowplot)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+source("functions/plotting_fxns.R")
+source("functions/scRNA_seq_analysis_functions.R")
+theme_set(theme_Publication())
+```
+
+## [Import data]{.underline}
+
+```{r}
+data <- readRDS("C:/Users/Eric/My Drive/Lab/datasets/EYW/CTR03_10x_240801/seurat_outs/CTR03_full.rds")
+```
+
+## [Remove doublets]{.underline}
+
+```{r}
+table(HTO=data$HTO_classification.global, CRISPR_call=data$crispr_classification)
+```
+
+```{r}
+data <- subset(data, subset = crispr_classification == "singlet")
+```
+
+## [Pseudobulk by sgRNA]{.underline}
+
+```{r}
+# perform pseudobulk aggregation
+pseudodata <- AggregateExpression(data, assays = "SCT", return.seurat = T, group.by = "feature_call")
+pseudodata <- pseudodata[!grepl("^Tra[vdj]|^Trb[vdj]",rownames(pseudodata)),]
+```
+
+```{r}
+library(DESeq2)
+
+# gather info for metadata
+# get UMIs per sgRNA
+# get frequency of single sgRNA integrations for individual sgRNA
+# get percent.mt
+metaData <- data@meta.data %>%
+  as_tibble(rownames = "cell_bc") %>%
+  group_by(feature_call) %>%
+  summarise(freq_cells = n()/nrow(data@meta.data),
+            median_sgRNA_umi = median(as.numeric(num_umis)),
+            mito_perc = mean(percent.mt))
+
+# convert metadata to df form
+ddsColData <- metaData  %>%
+  mutate(feature_gene = gsub("\\.\\d+$","",feature_call)) %>%
+  mutate(feature_gene = gsub("NTC|NCC","control",feature_gene)) %>%
+  as.data.frame()
+rownames(ddsColData) <- ddsColData$feature_call
+
+# create DESeq2 object
+dds <- DESeqDataSetFromMatrix(pseudodata@assays$SCT$counts,
+                              colData = ddsColData,
+                              design = ~ feature_gene)
+
+# perform VST normalization
+# essentially normalizes to library size while stabilizing variance for lowly expressed genes
+ddsNorm <- vst(dds)
+```
+
+```{r, fig.height=10, fig.width=10}
+p1 <- DESeq2::plotPCA(ddsNorm, intgroup = "feature_gene", ntop=2000, pcsToUse = 1:2) + theme(aspect.ratio = 1) +
+  ggtitle("Pseudobulk by Gene Target")
+p2 <- DESeq2::plotPCA(ddsNorm, intgroup = "feature_gene", ntop=2000, pcsToUse = 3:4) + theme(aspect.ratio = 1) +
+  ggtitle("Pseudobulk by Gene Target")
+p3 <- DESeq2::plotPCA(ddsNorm, intgroup = "feature_gene", ntop=2000, pcsToUse = 5:6) + theme(aspect.ratio = 1) +
+  ggtitle("Pseudobulk by Gene Target")
+p4 <- DESeq2::plotPCA(ddsNorm, intgroup = "feature_gene", ntop=2000, pcsToUse = 7:8) + theme(aspect.ratio = 1) +
+  ggtitle("Pseudobulk by Gene Target")
+
+(p1+p2)/(p3+p4)
+```
+
+```{r, fig.height=20, fig.width=22}
+library(ComplexHeatmap)
+library(viridis)
+
+# Get variable genes from pseudobulk data
+pseudodata <- FindVariableFeatures(pseudodata, nfeatures = 3000)
+varGenes <- VariableFeatures(pseudodata)
+
+# Extract the normalized matrix from the object and compute pairwise correlation values
+dds_mat <- assay(ddsNorm)
+dds_mat <- dds_mat[varGenes,]
+
+controlMat <- dds_mat[,grepl("NCC|NTC",colnames(dds_mat))]
+controlMean <- apply(controlMat, 1, mean) %>% as.matrix()
+controlSD <- apply(controlMat, 1, sd) %>% as.matrix()
+
+# calculate Zscore for each gene using mean and SD from control groups
+ddsZscore <- data.frame(row.names = rownames(dds_mat))
+for(i in 1:ncol(dds_mat)){
+  ddsZscore[,i] <- (dds_mat[,i]-controlMean)/controlSD
+}
+colnames(ddsZscore) <- colnames(dds_mat)
+# remove NA and Inf
+ddsZscore <- ddsZscore[is.finite(rowSums(ddsZscore)),]
+
+# construct correlation matrix
+dds_cor <- cor(ddsZscore, use = "complete.obs") %>%
+  as.matrix()
+
+# construct annotations
+annotation_col = data.frame(
+  freq_cells = ddsColData$freq_cells,
+  median_sgRNA_umi = ddsColData$median_sgRNA_umi,
+  mito_perc = ddsColData$mito_perc,
+  feature_gene = ddsColData$feature_gene
+)
+
+# Plot heatmap
+pheatmap(dds_cor, annotation_col = annotation_col,
+          color = viridis(n = 256, alpha = 1, option = "inferno"),
+         main = "Pearson Cor of Z-scored (centered to control)\nPseudobulked SCT counts of Top 2000 Var Genes")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
