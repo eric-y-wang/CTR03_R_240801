@@ -28,7 +28,7 @@ theme_set(theme_Publication())
 ## [Import data]{.underline}
 
 ```{r}
-data <- readRDS("C:/Users/Eric/My Drive/Lab/datasets/EYW/CTR03_10x_240801/seurat_outs/CTR03_full.rds")
+data <- readRDS("C:/Users/Eric/Documents/datasets/EYW/CTR03_10x_240801/seurat_outs/CTR03_full.rds")
 ```
 
 ## [Remove doublets]{.underline}
@@ -45,7 +45,7 @@ data <- subset(data, subset = crispr_classification == "singlet")
 
 ```{r}
 # perform pseudobulk aggregation
-pseudodata <- AggregateExpression(data, assays = "SCT", return.seurat = T, group.by = "feature_call")
+pseudodata <- AggregateExpression(data, assays = "RNA", return.seurat = T, group.by = "feature_call")
 pseudodata <- pseudodata[!grepl("^Tra[vdj]|^Trb[vdj]",rownames(pseudodata)),]
 ```
 
@@ -71,7 +71,7 @@ ddsColData <- metaData  %>%
 rownames(ddsColData) <- ddsColData$feature_call
 
 # create DESeq2 object
-dds <- DESeqDataSetFromMatrix(pseudodata@assays$SCT$counts,
+dds <- DESeqDataSetFromMatrix(pseudodata@assays$RNA$counts,
                               colData = ddsColData,
                               design = ~ feature_gene)
 
@@ -80,7 +80,7 @@ dds <- DESeqDataSetFromMatrix(pseudodata@assays$SCT$counts,
 ddsNorm <- vst(dds)
 ```
 
-```{r, fig.height=10, fig.width=10}
+```{r, fig.height=15, fig.width=15}
 p1 <- DESeq2::plotPCA(ddsNorm, intgroup = "feature_gene", ntop=2000, pcsToUse = 1:2) + theme(aspect.ratio = 1) +
   ggtitle("Pseudobulk by Gene Target")
 p2 <- DESeq2::plotPCA(ddsNorm, intgroup = "feature_gene", ntop=2000, pcsToUse = 3:4) + theme(aspect.ratio = 1) +
@@ -93,7 +93,7 @@ p4 <- DESeq2::plotPCA(ddsNorm, intgroup = "feature_gene", ntop=2000, pcsToUse = 
 (p1+p2)/(p3+p4)
 ```
 
-```{r, fig.height=20, fig.width=22}
+```{r, fig.height=15, fig.width=17}
 library(ComplexHeatmap)
 library(viridis)
 
@@ -132,8 +132,38 @@ annotation_col = data.frame(
 
 # Plot heatmap
 pheatmap(dds_cor, annotation_col = annotation_col,
-          color = viridis(n = 256, alpha = 1, option = "inferno"),
-         main = "Pearson Cor of Z-scored (centered to control)\nPseudobulked SCT counts of Top 2000 Var Genes")
+         color = viridis(n = 256, alpha = 1, option = "inferno"),
+         main = "Pearson Cor of Z-scored (centered to control)\nPseudobulked RNA counts of Top 3000 Var Genes")
+```
+```{r, fig.height=15, fig.width=17}
+library(ComplexHeatmap)
+library(viridis)
+
+# Get variable genes from pseudobulk data
+pseudodata <- FindVariableFeatures(pseudodata, nfeatures = 2000)
+varGenes <- VariableFeatures(pseudodata)
+
+# Extract the normalized matrix from the object and compute pairwise correlation values
+dds_mat <- assay(ddsNorm)
+dds_mat <- dds_mat[varGenes,]
+
+# construct correlation matrix
+dds_cor <- cor(dds_mat, use = "complete.obs") %>%
+  as.matrix()
+
+# construct annotations
+annotation_col = data.frame(
+  freq_cells = ddsColData$freq_cells,
+  median_sgRNA_umi = ddsColData$median_sgRNA_umi,
+  mito_perc = ddsColData$mito_perc,
+  feature_gene = ddsColData$feature_gene
+)
+
+# Plot heatmap
+pheatmap(dds_cor, annotation_col = annotation_col,
+         color = viridis(n = 256, alpha = 1, option = "inferno"),
+         breaks = seq(0.98,1,0.01),
+         main = "Pearson Cor\nPseudobulked RNA counts of Top 3000 Var Genes")
 ```
 
 
